@@ -36,6 +36,7 @@ end
 local thumb_queue = {} ---@type table[]
 local thumb_active = 0
 local rerender_timer = nil ---@type uv.uv_timer_t?
+local reflow_timer = nil ---@type uv.uv_timer_t?
 
 local function ensure_config()
   if not config then
@@ -101,35 +102,179 @@ function M._scan(dir)
   return files
 end
 
----@param file_count number
----@param win_w number
----@param win_h number
-function M._layout(file_count, win_w, win_h)
-  local pad = 2
-  local thumb_w = math.max(15, math.min(30, math.floor((win_w - pad) / 3) - pad))
-  local cols = math.max(1, math.floor((win_w + pad) / (thumb_w + pad)))
-  thumb_w = math.floor((win_w - pad * (cols - 1)) / cols)
-  local thumb_h = math.max(8, math.floor(thumb_w * 0.6))
-  local cell_h = thumb_h + 1
-  if cell_h > win_h then
-    thumb_h = math.max(6, win_h - 1)
-    cell_h = thumb_h + 1
-  end
-  local visible_rows = math.max(1, math.floor(win_h / cell_h))
-  local rows = math.max(1, math.ceil(file_count / cols))
-  return {
-    thumb_w = thumb_w, thumb_h = thumb_h,
-    cols = cols, rows = rows, pad = pad,
-    visible_rows = visible_rows,
-  }
-end
-
 local function thumb_cache_path(src)
   ensure_config()
   local stat = vim.uv.fs_stat(src)
   local mtime_sec = stat and stat.mtime.sec or 0
   local mtime_nsec = stat and stat.mtime.nsec or 0
   return config.thumb_cache .. "/" .. vim.fn.sha256(src .. ":" .. mtime_sec .. ":" .. mtime_nsec) .. ".png"
+end
+
+---@param thumb_w number
+---@param aspect_ratio number
+---@return number
+local function item_height(thumb_w, aspect_ratio)
+  local inner_w = math.max(1, thumb_w - 2)
+  if not aspect_ratio or aspect_ratio <= 0 then
+    aspect_ratio = 1
+  end
+  -- Terminal cells are not square (typically ~2:1 height:width).
+  -- Convert pixel aspect ratio to cell aspect ratio.
+  local terminal = Snacks.image.terminal.size()
+  local cell_ratio = terminal.cell_width / terminal.cell_height
+  local h = math.floor(inner_w * cell_ratio / aspect_ratio + 0.5)
+  return math.max(3, math.min(h, 30)) + 2
+end
+
+---@param g table
+---@param offset number
+---@return number
+local function clamp_scroll_offset(g, offset)
+  local max_scroll = math.max(0, g.total_h - g.win_h)
+  return math.max(0, math.min(offset or 0, max_scroll))
+end
+
+---@param g table
+---@param scroll_offset number
+---@param file_count number
+---@return integer[]
+local function find_visible_items(g, scroll_offset, file_count)
+  local visible = {}
+  local view_top = scroll_offset
+  local view_bottom = view_top + g.win_h
+  for idx = 1, file_count do
+    local item = g.items[idx]
+    if item then
+      local top = item.y
+      local bottom = item.y + item.h + 1
+      if bottom > view_top and top < view_bottom then
+        visible[#visible + 1] = idx
+      end
+    end
+  end
+  return visible
+end
+
+---@param s table
+---@param idx integer
+---@return boolean
+local function ensure_item_visible(s, idx)
+  local g = s.grid
+  if not g then return false end
+  local item = g.items[idx]
+  if not item then return false end
+  local view_top = s.scroll_offset
+  local view_bottom = view_top + g.win_h
+  local top = item.y
+  local bottom = item.y + item.h + 1
+  local new_offset = view_top
+  if (bottom - top) > g.win_h then
+    new_offset = top
+  elseif top < view_top then
+    new_offset = top
+  elseif bottom > view_bottom then
+    new_offset = bottom - g.win_h
+  end
+  new_offset = clamp_scroll_offset(g, new_offset)
+  if new_offset ~= s.scroll_offset then
+    s.scroll_offset = new_offset
+    return true
+  end
+  return false
+end
+
+---@param s table
+---@param idx integer
+---@return integer, integer
+local function cursor_pos_for_idx(s, idx)
+  local g = s.grid
+  local item = g and g.items[idx]
+  if not g or not item then return 1, 0 end
+  local row = item.y + item.h - s.scroll_offset + 1
+  local col = item.col * (g.thumb_w + g.pad) + math.floor(g.thumb_w / 2)
+  return row, col
+end
+
+---@param file_count number
+---@param win_w number
+---@param win_h number
+---@param files? {path: string, name: string}[]
+function M._layout(file_count, win_w, win_h, files)
+  local pad = 2
+  local thumb_w = math.max(15, math.min(30, math.floor((win_w - pad) / 3) - pad))
+  local cols = math.max(1, math.floor((win_w + pad) / (thumb_w + pad)))
+  thumb_w = math.max(7, math.floor((win_w - pad * (cols - 1)) / cols))
+  local win_h_cells = math.max(1, win_h)
+
+  files = files or (state and state.files) or {}
+  local count = math.min(file_count or #files, #files)
+
+  local items = {}
+  local col_heights = {}
+  local col_items = {}
+  local item_pos = {}
+  local total_h = 0
+  for col = 0, cols - 1 do
+    col_heights[col] = 0
+    col_items[col] = {}
+  end
+
+  for idx = 1, count do
+    local file = files[idx]
+    local aspect_ratio = 1
+    local estimated = true
+    if file and file.path then
+      local cached = thumb_cache_path(file.path)
+      if vim.uv.fs_stat(cached) then
+        local ok, dim = pcall(Snacks.image.util.dim, cached)
+        if ok and type(dim) == "table" then
+          local w = tonumber(dim.width)
+          local h = tonumber(dim.height)
+          if w and h and w > 0 and h > 0 then
+            aspect_ratio = w / h
+            estimated = false
+          end
+        end
+      end
+    end
+
+    local best_col = 0
+    local best_h = col_heights[0] or 0
+    for col = 1, cols - 1 do
+      local h = col_heights[col]
+      if h < best_h then
+        best_h = h
+        best_col = col
+      end
+    end
+
+    local h = item_height(thumb_w, aspect_ratio)
+    local y = col_heights[best_col]
+    items[idx] = {
+      col = best_col,
+      y = y,
+      h = h,
+      estimated = estimated,
+    }
+
+    col_heights[best_col] = y + h + 1
+    total_h = math.max(total_h, col_heights[best_col])
+    local col_list = col_items[best_col]
+    col_list[#col_list + 1] = idx
+    item_pos[idx] = #col_list
+  end
+
+  return {
+    thumb_w = thumb_w,
+    cols = cols,
+    pad = pad,
+    items = items,
+    col_heights = col_heights,
+    col_items = col_items,
+    item_pos = item_pos,
+    total_h = math.max(total_h, 1),
+    win_h = win_h_cells,
+  }
 end
 
 local function process_thumb_queue()
@@ -205,57 +350,56 @@ function M._update_visual()
   if not vim.api.nvim_win_is_valid(s.win) then return end
   if not vim.api.nvim_buf_is_valid(s.buf) then return end
 
-  local sel_idx = s.cur_row * g.cols + s.cur_col + 1
+  local sel_idx = math.max(1, math.min(s.cur_idx or 1, #s.files))
+  s.cur_idx = sel_idx
 
   -- 1. Update winhighlight on each thumbnail window
-  local cell_w = g.thumb_w + g.pad
-  local start_row = s.scroll_offset
-  local tw_i = 0
-  for vis_row = 0, math.min(g.visible_rows - 1, g.rows - 1 - start_row) do
-    local grid_row = start_row + vis_row
-    for col = 0, g.cols - 1 do
-      local idx = grid_row * g.cols + col + 1
-      if idx <= #s.files then
-        tw_i = tw_i + 1
-        local tw = s.thumb_wins[tw_i]
-        if tw and vim.api.nvim_win_is_valid(tw.win) then
-          local hl = idx == sel_idx
-            and "FloatBorder:GalleryBorderSel"
-            or "FloatBorder:GalleryBorder"
-          vim.wo[tw.win].winhighlight = hl
-        end
-      end
+  for _, tw in ipairs(s.thumb_wins or {}) do
+    if tw and vim.api.nvim_win_is_valid(tw.win) then
+      local hl = tw.idx == sel_idx
+        and "FloatBorder:GalleryBorderSel"
+        or "FloatBorder:GalleryBorder"
+      vim.wo[tw.win].winhighlight = hl
     end
   end
 
   -- 2. Clear namespace and re-add filename extmarks
   vim.api.nvim_buf_clear_namespace(s.buf, ns, 0, -1)
-  local cell_h = g.thumb_h + 1
-  for vis_row = 0, math.min(g.visible_rows - 1, g.rows - 1 - start_row) do
-    local grid_row = start_row + vis_row
-    local fname_line = vis_row * cell_h + g.thumb_h -- 0-indexed
-    local line = vim.api.nvim_buf_get_lines(s.buf, fname_line, fname_line + 1, false)[1]
-    if not line then goto next_row end
-    for col = 0, g.cols - 1 do
-      local idx = grid_row * g.cols + col + 1
-      if idx > #s.files then break end
-      local name = s.files[idx].name
-      if #name > g.thumb_w then
-        name = name:sub(1, g.thumb_w - 1) .. "…"
+  local visible = s.visible_items or find_visible_items(g, s.scroll_offset, #s.files)
+  for _, idx in ipairs(visible) do
+    local item = g.items[idx]
+    local file = s.files[idx]
+    if item and file then
+      local fname_line = item.y + item.h - s.scroll_offset
+      if fname_line >= 0 and fname_line < g.win_h then
+        local line = vim.api.nvim_buf_get_lines(s.buf, fname_line, fname_line + 1, false)[1]
+        if line then
+          local name = file.name
+          while vim.api.nvim_strwidth(name) > g.thumb_w and vim.fn.strchars(name) > 0 do
+            name = vim.fn.strcharpart(name, 0, vim.fn.strchars(name) - 1)
+          end
+          if name ~= file.name and g.thumb_w > 0 then
+            if vim.api.nvim_strwidth(name) >= g.thumb_w then
+              name = vim.fn.strcharpart(name, 0, math.max(0, vim.fn.strchars(name) - 1))
+            end
+            name = name .. "…"
+          end
+
+          local col_start = item.col * (g.thumb_w + g.pad)
+          local total_pad = g.thumb_w - vim.api.nvim_strwidth(name)
+          local left_pad = math.floor(math.max(0, total_pad) / 2)
+          local name_start = col_start + left_pad
+          local name_end = math.min(name_start + #name, #line)
+          if name_end > name_start then
+            local hl = idx == sel_idx and "GalleryFilenameSel" or "GalleryFilename"
+            vim.api.nvim_buf_set_extmark(s.buf, ns, fname_line, name_start, {
+              end_col = name_end,
+              hl_group = hl,
+            })
+          end
+        end
       end
-      local col_start = col * cell_w
-      local total_pad = cell_w - vim.api.nvim_strwidth(name)
-      local left_pad = math.floor(total_pad / 2)
-      local name_start = col_start + left_pad
-      local name_end = name_start + #name
-      if name_end > #line then name_end = #line end
-      local hl = idx == sel_idx and "GalleryFilenameSel" or "GalleryFilename"
-      vim.api.nvim_buf_set_extmark(s.buf, ns, fname_line, name_start, {
-        end_col = name_end,
-        hl_group = hl,
-      })
     end
-    ::next_row::
   end
 
   -- 3. Update footer on main window
@@ -293,8 +437,13 @@ function M._render_visible()
   local s = state
   if not s then return end
   local grid = s.grid
+  if not grid then return end
+  if not vim.api.nvim_win_is_valid(s.win) then return end
+  if not vim.api.nvim_buf_is_valid(s.buf) then return end
+
+  grid.win_h = vim.api.nvim_win_get_height(s.win)
+  s.scroll_offset = clamp_scroll_offset(grid, s.scroll_offset)
   local files = s.files
-  local cell_h = grid.thumb_h + 1
   local cell_w = grid.thumb_w + grid.pad
 
   -- Cancel pending thumbnail jobs and tear down old thumbnails
@@ -304,81 +453,148 @@ function M._render_visible()
   s.thumb_wins = {}
   s.thumb_jobs = {}
 
-  local start_row = s.scroll_offset
-  local end_row = math.min(start_row + grid.visible_rows - 1, grid.rows - 1)
+  local visible = find_visible_items(grid, s.scroll_offset, #files)
+  s.visible_items = visible
 
-  -- Build buffer content for visible rows only
+  -- Build a viewport-sized backing buffer and place filenames at item-specific rows.
+  local total_w = math.max(1, grid.cols * cell_w - grid.pad)
+  local blank = string.rep(" ", total_w)
   local lines = {}
-  for row = start_row, end_row do
-    for _ = 1, grid.thumb_h do
-      lines[#lines + 1] = ""
-    end
-    local fname_parts = {}
-    for col = 0, grid.cols - 1 do
-      local idx = row * grid.cols + col + 1
-      if idx <= #files then
-        local name = files[idx].name
-        if #name > grid.thumb_w then
-          name = name:sub(1, grid.thumb_w - 1) .. "…"
+  for _ = 1, grid.win_h do
+    lines[#lines + 1] = blank
+  end
+
+  for _, idx in ipairs(visible) do
+    local item = grid.items[idx]
+    local file = files[idx]
+    if item and file then
+      local line_idx = item.y + item.h - s.scroll_offset
+      if line_idx >= 0 and line_idx < grid.win_h then
+        local name = file.name
+        while vim.api.nvim_strwidth(name) > grid.thumb_w and vim.fn.strchars(name) > 0 do
+          name = vim.fn.strcharpart(name, 0, vim.fn.strchars(name) - 1)
         end
-        local total_pad = cell_w - vim.api.nvim_strwidth(name)
-        local left_pad = math.floor(total_pad / 2)
-        local right_pad = total_pad - left_pad
-        fname_parts[#fname_parts + 1] = string.rep(" ", left_pad) .. name .. string.rep(" ", right_pad)
+        if name ~= file.name and grid.thumb_w > 0 then
+          if vim.api.nvim_strwidth(name) >= grid.thumb_w then
+            name = vim.fn.strcharpart(name, 0, math.max(0, vim.fn.strchars(name) - 1))
+          end
+          name = name .. "…"
+        end
+
+        local total_pad = grid.thumb_w - vim.api.nvim_strwidth(name)
+        local left_pad = math.floor(math.max(0, total_pad) / 2)
+        local col_start = item.col * cell_w + left_pad
+        local line = lines[line_idx + 1]
+        if line and col_start < #line then
+          local text = name
+          local max_len = #line - col_start
+          if max_len > 0 then
+            if #text > max_len then
+              text = text:sub(1, max_len)
+            end
+            lines[line_idx + 1] = line:sub(1, col_start) .. text .. line:sub(col_start + #text + 1)
+          end
+        end
       end
     end
-    lines[#lines + 1] = table.concat(fname_parts)
   end
 
   vim.bo[s.buf].modifiable = true
   vim.api.nvim_buf_set_lines(s.buf, 0, -1, false, lines)
   vim.bo[s.buf].modifiable = false
 
-  -- Create thumbnail windows at fixed positions relative to main window
-  for vis_row = 0, end_row - start_row do
-    local grid_row = start_row + vis_row
-    for col = 0, grid.cols - 1 do
-      local idx = grid_row * grid.cols + col + 1
-      if idx <= #files then
+  -- Create thumbnail windows for visible items only.
+  for _, idx in ipairs(visible) do
+    local item = grid.items[idx]
+    local file = files[idx]
+    if item and file then
+      local view_top = s.scroll_offset
+      local view_bottom = view_top + grid.win_h
+      local thumb_top = item.y
+      local thumb_bottom = item.y + item.h
+      if thumb_bottom > view_top and thumb_top < view_bottom then
         local thumb_buf = vim.api.nvim_create_buf(false, true)
-        local thumb_win = vim.api.nvim_open_win(thumb_buf, false, {
+        local ok, thumb_win = pcall(vim.api.nvim_open_win, thumb_buf, false, {
           relative = "win",
           win = s.win,
-          row = vis_row * cell_h,
-          col = col * cell_w,
+          row = item.y - s.scroll_offset,
+          col = item.col * cell_w,
           width = grid.thumb_w - 2,
-          height = grid.thumb_h - 2,
+          height = item.h - 2,
           style = "minimal",
           border = "rounded",
           focusable = false,
           zindex = 51,
         })
+        if ok then
+          vim.bo[thumb_buf].filetype = "image"
+          vim.bo[thumb_buf].modifiable = false
+          vim.bo[thumb_buf].swapfile = false
 
-        vim.bo[thumb_buf].filetype = "image"
-        vim.bo[thumb_buf].modifiable = false
-        vim.bo[thumb_buf].swapfile = false
+          local tw = { buf = thumb_buf, win = thumb_win, placement = nil, idx = idx }
+          s.thumb_wins[#s.thumb_wins + 1] = tw
 
-        local tw = { buf = thumb_buf, win = thumb_win, placement = nil }
-        s.thumb_wins[#s.thumb_wins + 1] = tw
+          local function attach_thumb(thumb_path)
+            if state ~= s then return end
+            if not vim.api.nvim_buf_is_valid(thumb_buf) then return end
+            if not vim.api.nvim_win_is_valid(thumb_win) then return end
+            tw.placement = Snacks.image.placement.new(thumb_buf, thumb_path, {
+              conceal = true,
+              auto_resize = true,
+            })
 
-        local function attach_thumb(thumb_path)
-          if state ~= s then return end
-          if not vim.api.nvim_buf_is_valid(thumb_buf) then return end
-          if not vim.api.nvim_win_is_valid(thumb_win) then return end
-          tw.placement = Snacks.image.placement.new(thumb_buf, thumb_path, {
-            conceal = true,
-            auto_resize = true,
-          })
-        end
+            -- Mark item for reflow if actual dimensions differ from estimate
+            local current_grid = s.grid
+            local current_item = current_grid and current_grid.items[idx]
+            if not current_item or not current_item.estimated then return end
+            local ok_dim, dim = pcall(Snacks.image.util.dim, thumb_path)
+            if not ok_dim or type(dim) ~= "table" then return end
+            local w = tonumber(dim.width)
+            local h = tonumber(dim.height)
+            if not w or not h or w <= 0 or h <= 0 then return end
+            local new_h = item_height(current_grid.thumb_w, w / h)
+            if new_h ~= current_item.h then
+              s.needs_reflow = true
+              -- Debounce: wait for more thumbnails to arrive before reflowing
+              if reflow_timer and not reflow_timer:is_closing() then
+                reflow_timer:stop()
+                reflow_timer:close()
+              end
+              reflow_timer = assert(vim.uv.new_timer())
+              reflow_timer:start(1000, 0, vim.schedule_wrap(function()
+                if reflow_timer and not reflow_timer:is_closing() then
+                  reflow_timer:stop()
+                  reflow_timer:close()
+                end
+                reflow_timer = nil
+                if state ~= s or not s.needs_reflow then return end
+                if not vim.api.nvim_win_is_valid(s.win) then return end
+                s.needs_reflow = false
+                local win_w = vim.api.nvim_win_get_width(s.win)
+                local win_h = vim.api.nvim_win_get_height(s.win)
+                s.grid = M._layout(#s.files, win_w, win_h, s.files)
+                s.scroll_offset = clamp_scroll_offset(s.grid, s.scroll_offset)
+                ensure_item_visible(s, s.cur_idx)
+                M._render_visible()
+                if state == s then
+                  M._restore_cursor()
+                end
+              end))
+            end
+          end
 
-        -- Use cached thumbnail if available, otherwise queue generation
-        local cached = thumb_cache_path(files[idx].path)
-        if vim.uv.fs_stat(cached) then
-          attach_thumb(cached)
+          local cached = thumb_cache_path(file.path)
+          if vim.uv.fs_stat(cached) then
+            attach_thumb(cached)
+          else
+            local job = { src = file.path, callback = attach_thumb, cancelled = false, proc = nil }
+            s.thumb_jobs[#s.thumb_jobs + 1] = job
+            thumb_queue[#thumb_queue + 1] = job
+          end
         else
-          local job = { src = files[idx].path, callback = attach_thumb, cancelled = false, proc = nil }
-          s.thumb_jobs[#s.thumb_jobs + 1] = job
-          thumb_queue[#thumb_queue + 1] = job
+          if vim.api.nvim_buf_is_valid(thumb_buf) then
+            vim.api.nvim_buf_delete(thumb_buf, { force = true })
+          end
         end
       end
     end
@@ -395,42 +611,28 @@ function M._render_visible()
   M._update_visual()
 end
 
-function M._setup_keys(buf, win, files, grid)
-  local function move_to_cell(r, c)
+function M._setup_keys(buf, win, files, _grid)
+  local function move_to_idx(idx)
     local s = state
     if not s then return end
     local g = s.grid
-    if not g then return end
-    r = math.max(0, math.min(r, g.rows - 1))
-    c = math.max(0, math.min(c, g.cols - 1))
-    local idx = r * g.cols + c + 1
-    if idx > #files then return end
+    if not g or #files == 0 then return end
+    idx = math.max(1, math.min(idx, #files))
+    if not g.items[idx] then return end
+    s.cur_idx = idx
 
-    s.cur_row, s.cur_col = r, c
-
-    -- Scroll if target cell is outside visible range
-    local need_scroll = false
-    if r < s.scroll_offset then
-      s.scroll_offset = r
-      need_scroll = true
-    elseif r >= s.scroll_offset + g.visible_rows then
-      s.scroll_offset = r - g.visible_rows + 1
-      need_scroll = true
-    end
-
-    if need_scroll then
+    if ensure_item_visible(s, idx) then
       M._render_visible()
       if state ~= s then return end
       g = s.grid
       if not g then return end
     end
 
-    -- Place cursor on filename line within the visible buffer
-    local cell_h = g.thumb_h + 1
-    local cell_w = g.thumb_w + g.pad
-    local vis_row = r - s.scroll_offset
-    local target_row = vis_row * cell_h + g.thumb_h + 1 -- 1-indexed
-    local target_col = c * cell_w + math.floor(cell_w / 2)
+    local target_row, target_col = cursor_pos_for_idx(s, idx)
+    local line_count = vim.api.nvim_buf_line_count(s.buf)
+    target_row = math.max(1, math.min(target_row, line_count))
+    local line = vim.api.nvim_buf_get_lines(s.buf, target_row - 1, target_row, false)[1] or ""
+    target_col = math.max(0, math.min(target_col, math.max(0, #line - 1)))
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_set_cursor(win, { target_row, target_col })
     end
@@ -438,48 +640,72 @@ function M._setup_keys(buf, win, files, grid)
     M._update_visual()
   end
 
-  local function move(dr, dc)
+  local function move_vertical(step)
     local s = state
     if not s then return end
     local g = s.grid
     if not g then return end
-    local nr, nc = s.cur_row + dr, s.cur_col + dc
-    if nc < 0 then
-      nc = g.cols - 1
-      nr = nr - 1
-    elseif nc >= g.cols then
-      nc = 0
-      nr = nr + 1
+    local item = g.items[s.cur_idx]
+    if not item then return end
+    local col_list = g.col_items[item.col] or {}
+    local pos = g.item_pos[s.cur_idx]
+    if not pos then return end
+    local target = col_list[pos + step]
+    if target then
+      move_to_idx(target)
     end
-    if nr < 0 or nr >= g.rows then return end
-    local idx = nr * g.cols + nc + 1
-    if idx > #files then return end
-    move_to_cell(nr, nc)
+  end
+
+  local function move_horizontal(delta)
+    local s = state
+    if not s then return end
+    local g = s.grid
+    if not g then return end
+    local item = g.items[s.cur_idx]
+    if not item then return end
+    local target_col = item.col + delta
+    if target_col < 0 or target_col >= g.cols then return end
+    local col_list = g.col_items[target_col] or {}
+    if #col_list == 0 then return end
+
+    local center = item.y + item.h / 2
+    local best_idx = nil
+    local best_dist = math.huge
+    for _, idx in ipairs(col_list) do
+      local other = g.items[idx]
+      if other then
+        local dist = math.abs((other.y + other.h / 2) - center)
+        if dist < best_dist then
+          best_dist = dist
+          best_idx = idx
+        end
+      end
+    end
+    if best_idx then
+      move_to_idx(best_idx)
+    end
   end
 
   local kopts = { buffer = buf, nowait = true }
 
-  vim.keymap.set("n", "h", function() move(0, -1) end, kopts)
-  vim.keymap.set("n", "l", function() move(0, 1) end, kopts)
-  vim.keymap.set("n", "j", function() move(1, 0) end, kopts)
-  vim.keymap.set("n", "k", function() move(-1, 0) end, kopts)
-  vim.keymap.set("n", "<Left>", function() move(0, -1) end, kopts)
-  vim.keymap.set("n", "<Right>", function() move(0, 1) end, kopts)
-  vim.keymap.set("n", "<Down>", function() move(1, 0) end, kopts)
-  vim.keymap.set("n", "<Up>", function() move(-1, 0) end, kopts)
+  vim.keymap.set("n", "h", function() move_horizontal(-1) end, kopts)
+  vim.keymap.set("n", "l", function() move_horizontal(1) end, kopts)
+  vim.keymap.set("n", "j", function() move_vertical(1) end, kopts)
+  vim.keymap.set("n", "k", function() move_vertical(-1) end, kopts)
+  vim.keymap.set("n", "<Left>", function() move_horizontal(-1) end, kopts)
+  vim.keymap.set("n", "<Right>", function() move_horizontal(1) end, kopts)
+  vim.keymap.set("n", "<Down>", function() move_vertical(1) end, kopts)
+  vim.keymap.set("n", "<Up>", function() move_vertical(-1) end, kopts)
 
   vim.keymap.set("n", "<CR>", function()
     ensure_config()
     local s = state
     if not s then return end
-    local g = s.grid
-    if not g then return end
-    local idx = s.cur_row * g.cols + s.cur_col + 1
-    if idx > #files then return end
+    local idx = s.cur_idx
+    if not idx or idx > #files then return end
     local cmd = vim.deepcopy(config.open_cmd)
     cmd[#cmd + 1] = files[idx].path
     vim.fn.jobstart(cmd, { detach = true })
-    -- Re-render after neovim's screen redraw settles
     vim.defer_fn(function()
       if state == s and vim.api.nvim_win_is_valid(s.win) then
         M._render_visible()
@@ -491,20 +717,16 @@ function M._setup_keys(buf, win, files, grid)
   vim.keymap.set("n", "p", function()
     local s = state
     if not s then return end
-    local g = s.grid
-    if not g then return end
-    local idx = s.cur_row * g.cols + s.cur_col + 1
-    if idx > #files then return end
+    local idx = s.cur_idx
+    if not idx or idx > #files then return end
     M._preview(files[idx].path)
   end, kopts)
 
   vim.keymap.set("n", "r", function()
     local s = state
     if not s then return end
-    local g = s.grid
-    if not g then return end
-    local idx = s.cur_row * g.cols + s.cur_col + 1
-    if idx > #files then return end
+    local idx = s.cur_idx
+    if not idx or idx > #files then return end
     local file = files[idx]
     local dir = vim.fn.fnamemodify(file.path, ":h")
     vim.ui.input({ prompt = "Rename: ", default = file.name }, function(new_name)
@@ -523,20 +745,21 @@ function M._setup_keys(buf, win, files, grid)
       file.path = new_path
       file.name = new_name
       table.sort(files, function(a, b) return a.name:lower() < b.name:lower() end)
-      g = s.grid
-      if g then
-        for i, f in ipairs(files) do
-          if f == file then
-            local zero = i - 1
-            s.cur_row = math.floor(zero / g.cols)
-            s.cur_col = zero % g.cols
-            break
-          end
+      for i, f in ipairs(files) do
+        if f == file then
+          s.cur_idx = i
+          break
         end
       end
+      if not vim.api.nvim_win_is_valid(s.win) then return end
+      local win_w = vim.api.nvim_win_get_width(s.win)
+      local win_h = vim.api.nvim_win_get_height(s.win)
+      s.grid = M._layout(#files, win_w, win_h, files)
+      s.scroll_offset = clamp_scroll_offset(s.grid, s.scroll_offset)
+      ensure_item_visible(s, s.cur_idx)
       M._render_visible()
       if state == s then
-        move_to_cell(s.cur_row, s.cur_col)
+        move_to_idx(s.cur_idx)
       end
     end)
   end, kopts)
@@ -544,10 +767,8 @@ function M._setup_keys(buf, win, files, grid)
   vim.keymap.set("n", "d", function()
     local s = state
     if not s then return end
-    local g = s.grid
-    if not g then return end
-    local idx = s.cur_row * g.cols + s.cur_col + 1
-    if idx > #files then return end
+    local idx = s.cur_idx
+    if not idx or idx > #files then return end
     local file = files[idx]
     vim.ui.input({ prompt = "Delete " .. file.name .. "? (y/N): " }, function(answer)
       if state ~= s then return end
@@ -563,22 +784,16 @@ function M._setup_keys(buf, win, files, grid)
         vim.notify("Gallery: directory is now empty", vim.log.levels.INFO)
         return
       end
-      -- Adjust grid rows and cursor
-      g = s.grid
-      if not g then return end
-      s.grid.rows = math.ceil(#files / g.cols)
-      if s.cur_row >= s.grid.rows then
-        s.cur_row = s.grid.rows - 1
-      end
-      if s.cur_row * g.cols + s.cur_col + 1 > #files then
-        s.cur_col = (#files - 1) % g.cols
-      end
-      if s.scroll_offset > 0 and s.scroll_offset + g.visible_rows > s.grid.rows then
-        s.scroll_offset = math.max(0, s.grid.rows - g.visible_rows)
-      end
+      s.cur_idx = math.min(idx, #files)
+      if not vim.api.nvim_win_is_valid(s.win) then return end
+      local win_w = vim.api.nvim_win_get_width(s.win)
+      local win_h = vim.api.nvim_win_get_height(s.win)
+      s.grid = M._layout(#files, win_w, win_h, files)
+      s.scroll_offset = clamp_scroll_offset(s.grid, s.scroll_offset)
+      ensure_item_visible(s, s.cur_idx)
       M._render_visible()
       if state == s then
-        move_to_cell(s.cur_row, s.cur_col)
+        move_to_idx(s.cur_idx)
       end
     end)
   end, kopts)
@@ -586,7 +801,7 @@ function M._setup_keys(buf, win, files, grid)
   vim.keymap.set("n", "q", function() M.close() end, kopts)
   vim.keymap.set("n", "<Esc>", function() M.close() end, kopts)
 
-  move_to_cell(0, 0)
+  move_to_idx((state and state.cur_idx) or 1)
 end
 
 --- Restore cursor to the current cell after re-render
@@ -596,11 +811,15 @@ function M._restore_cursor()
   if not vim.api.nvim_win_is_valid(s.win) then return end
   if not vim.api.nvim_buf_is_valid(s.buf) then return end
   local g = s.grid
-  local cell_h = g.thumb_h + 1
-  local cell_w = g.thumb_w + g.pad
-  local vis_row = s.cur_row - s.scroll_offset
-  local target_row = vis_row * cell_h + g.thumb_h + 1
-  local target_col = s.cur_col * cell_w + math.floor(cell_w / 2)
+  local idx = math.max(1, math.min(s.cur_idx or 1, #s.files))
+  s.cur_idx = idx
+  if ensure_item_visible(s, idx) then
+    M._render_visible()
+    if state ~= s then return end
+    g = s.grid
+    if not g then return end
+  end
+  local target_row, target_col = cursor_pos_for_idx(s, idx)
   local line_count = vim.api.nvim_buf_line_count(s.buf)
   target_row = math.max(1, math.min(target_row, line_count))
   local line_len = #(vim.api.nvim_buf_get_lines(s.buf, target_row - 1, target_row, false)[1] or "")
@@ -749,7 +968,7 @@ function M.open(dir)
 
   vim.wo[win].wrap = false
 
-  local grid = M._layout(#files, width, height)
+  local grid = M._layout(#files, width, height, files)
 
   local augroup = vim.api.nvim_create_augroup("snacks-gallery", { clear = true })
 
@@ -761,8 +980,7 @@ function M.open(dir)
     grid = grid,
     dir = dir,
     scroll_offset = 0,
-    cur_row = 0,
-    cur_col = 0,
+    cur_idx = 1,
     augroup = augroup,
   }
 
@@ -792,8 +1010,6 @@ function M.open(dir)
 
       local new_w = math.floor(vim.o.columns * config.win_scale)
       local new_h = math.floor(vim.o.lines * config.win_scale)
-      local old_grid = s.grid
-      local old_idx = s.cur_row * old_grid.cols + s.cur_col
       vim.api.nvim_win_set_config(s.win, {
         relative = "editor",
         width = new_w,
@@ -802,20 +1018,10 @@ function M.open(dir)
         col = math.floor((vim.o.columns - new_w) / 2),
       })
 
-      s.grid = M._layout(#s.files, new_w, new_h)
-      -- Remap cursor from old grid to new grid using flat index
-      s.cur_row = math.floor(old_idx / s.grid.cols)
-      s.cur_col = old_idx % s.grid.cols
-      -- Clamp scroll/cursor to new grid dimensions
-      if s.cur_row >= s.grid.rows then
-        s.cur_row = s.grid.rows - 1
-      end
-      if s.cur_row * s.grid.cols + s.cur_col + 1 > #s.files then
-        s.cur_col = math.max(0, (#s.files - 1) % s.grid.cols)
-      end
-      if s.scroll_offset + s.grid.visible_rows > s.grid.rows then
-        s.scroll_offset = math.max(0, s.grid.rows - s.grid.visible_rows)
-      end
+      s.grid = M._layout(#s.files, new_w, new_h, s.files)
+      s.cur_idx = math.max(1, math.min(s.cur_idx or 1, #s.files))
+      s.scroll_offset = clamp_scroll_offset(s.grid, s.scroll_offset)
+      ensure_item_visible(s, s.cur_idx)
 
       schedule_rerender(s)
     end,
@@ -863,6 +1069,11 @@ function M.close()
     rerender_timer:close()
   end
   rerender_timer = nil
+  if reflow_timer and not reflow_timer:is_closing() then
+    reflow_timer:stop()
+    reflow_timer:close()
+  end
+  reflow_timer = nil
 
   cancel_thumb_jobs(s.thumb_jobs)
   thumb_queue = {}
