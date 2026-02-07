@@ -21,8 +21,7 @@ local ns = vim.api.nvim_create_namespace("snacks-gallery")
 
 -- Highlight groups (colorscheme-compatible, user overrides take precedence)
 for _, def in ipairs({
-  { "GalleryBorder",      "FloatBorder" },
-  { "GalleryBorderSel",   "Special" },
+  { "GalleryBg",          "Normal" },
   { "GalleryFilename",    "Comment" },
   { "GalleryFilenameSel", "Title" },
   { "GalleryFooter",      "Comment" },
@@ -31,6 +30,15 @@ for _, def in ipairs({
   { "GalleryFooterVal",   "Normal" },
 }) do
   vim.api.nvim_set_hl(0, def[1], { link = def[2], default = true })
+end
+
+-- Border highlights: fg-only (no bg) so border cells inherit GalleryBg
+-- from the window's winhighlight. Resolved dynamically from FloatBorder/Special.
+local function setup_border_highlights()
+  local fb = vim.api.nvim_get_hl(0, { name = "FloatBorder", link = false })
+  local sp = vim.api.nvim_get_hl(0, { name = "Special", link = false })
+  vim.api.nvim_set_hl(0, "GalleryBorder", { fg = fb.fg, default = true })
+  vim.api.nvim_set_hl(0, "GalleryBorderSel", { fg = sp.fg, bold = true, default = true })
 end
 
 local thumb_queue = {} ---@type table[]
@@ -356,10 +364,8 @@ function M._update_visual()
   -- 1. Update winhighlight on each thumbnail window
   for _, tw in ipairs(s.thumb_wins or {}) do
     if tw and vim.api.nvim_win_is_valid(tw.win) then
-      local hl = tw.idx == sel_idx
-        and "FloatBorder:GalleryBorderSel"
-        or "FloatBorder:GalleryBorder"
-      vim.wo[tw.win].winhighlight = hl
+      local border_hl = tw.idx == sel_idx and "GalleryBorderSel" or "GalleryBorder"
+      vim.wo[tw.win].winhighlight = "Normal:GalleryBg,NormalFloat:GalleryBg,FloatBorder:" .. border_hl
     end
   end
 
@@ -503,24 +509,31 @@ function M._render_visible()
   vim.api.nvim_buf_set_lines(s.buf, 0, -1, false, lines)
   vim.bo[s.buf].modifiable = false
 
-  -- Create thumbnail windows for visible items only.
+  -- Create thumbnail windows for visible items, clipped to viewport.
   for _, idx in ipairs(visible) do
     local item = grid.items[idx]
     local file = files[idx]
     if item and file then
-      local view_top = s.scroll_offset
-      local view_bottom = view_top + grid.win_h
-      local thumb_top = item.y
-      local thumb_bottom = item.y + item.h
-      if thumb_bottom > view_top and thumb_top < view_bottom then
+      local win_row = item.y - s.scroll_offset
+
+      -- Skip items that start above the viewport (can't crop from top)
+      if win_row < 0 then goto next_thumb end
+
+      -- Clip items that extend past the bottom of the viewport
+      local avail_h = grid.win_h - win_row
+      local display_h = math.min(item.h, avail_h)
+      local inner_h = display_h - 2 -- subtract border
+      if inner_h < 1 then goto next_thumb end
+
+      do
         local thumb_buf = vim.api.nvim_create_buf(false, true)
         local ok, thumb_win = pcall(vim.api.nvim_open_win, thumb_buf, false, {
           relative = "win",
           win = s.win,
-          row = item.y - s.scroll_offset,
+          row = win_row,
           col = item.col * cell_w,
           width = grid.thumb_w - 2,
-          height = item.h - 2,
+          height = inner_h,
           style = "minimal",
           border = "rounded",
           focusable = false,
@@ -530,6 +543,7 @@ function M._render_visible()
           vim.bo[thumb_buf].filetype = "image"
           vim.bo[thumb_buf].modifiable = false
           vim.bo[thumb_buf].swapfile = false
+          vim.wo[thumb_win].winhighlight = "Normal:GalleryBg,NormalFloat:GalleryBg"
 
           local tw = { buf = thumb_buf, win = thumb_win, placement = nil, idx = idx }
           s.thumb_wins[#s.thumb_wins + 1] = tw
@@ -596,8 +610,9 @@ function M._render_visible()
             vim.api.nvim_buf_delete(thumb_buf, { force = true })
           end
         end
-      end
+      end -- do
     end
+    ::next_thumb::
   end
 
   -- Start processing queued thumbnail jobs
@@ -896,6 +911,7 @@ end
 ---@param dir? string
 function M.open(dir)
   ensure_config()
+  setup_border_highlights()
   if state then M.close() end
 
   if not dir then
@@ -967,6 +983,7 @@ function M.open(dir)
   })
 
   vim.wo[win].wrap = false
+  vim.wo[win].winhighlight = "Normal:GalleryBg,NormalFloat:GalleryBg"
 
   local grid = M._layout(#files, width, height, files)
 
