@@ -45,7 +45,6 @@ end
 local thumb_queue = {} ---@type table[]
 local thumb_active = 0
 local rerender_timer = nil ---@type uv.uv_timer_t?
-local reflow_timer = nil ---@type uv.uv_timer_t?
 
 local function ensure_config()
   if not config then
@@ -209,20 +208,68 @@ local function thumb_cache_path(src)
   return config.thumb_cache .. "/" .. vim.fn.sha256(src .. ":" .. mtime_sec .. ":" .. mtime_nsec) .. ".png"
 end
 
----@param thumb_w number
----@param aspect_ratio number
----@return number
-local function item_height(thumb_w, aspect_ratio)
-  local inner_w = math.max(1, thumb_w - 2)
-  if not aspect_ratio or aspect_ratio <= 0 then
-    aspect_ratio = 1
+--- Predict the rendered cell dimensions of a cached thumbnail, accounting for
+--- DPI metadata the way snacks does.  Thumbnails produced by magick -strip
+--- carry 72 DPI; snacks multiplies by (96/dpi * terminal.scale), making the
+--- effective cell footprint larger than the raw pixel→cell conversion.
+---
+--- Returns (fit_w, fit_h) — the cell dimensions the image will occupy when
+--- placed inside a max_w × max_h window.  Returns nil when the path is
+--- unavailable or the image can't be read.
+---@param cached_path string
+---@param max_w number  available inner width in cells
+---@param max_h number  available inner height in cells
+---@return number?, number?  fit_w, fit_h
+local function dpi_fit(cached_path, max_w, max_h)
+  local ok_dim, dim = pcall(Snacks.image.util.dim, cached_path)
+  if not ok_dim or not dim or not dim.width or dim.width <= 0 then return nil, nil end
+  local terminal = Snacks.image.terminal.size()
+  -- DPI-adjusted pixel dimensions (mirrors snacks' util.fit with info)
+  -- Thumbnails from `magick … -strip` retain 72 DPI
+  local dpi_factor = 96 / 72 * terminal.scale
+  local adj_w = dim.width * dpi_factor
+  local adj_h = dim.height * dpi_factor
+  local cell_w = math.max(1, math.ceil(adj_w / terminal.cell_width))
+  local cell_h = math.max(1, math.ceil(adj_h / terminal.cell_height))
+  -- No upscale: image fits at natural DPI-adjusted size
+  if cell_w <= max_w and cell_h <= max_h then
+    return cell_w, cell_h
   end
-  -- Terminal cells are not square (typically ~2:1 height:width).
-  -- Convert pixel aspect ratio to cell aspect ratio.
+  -- Aspect-ratio fitting — mirrors snacks' util.fit exactly
+  local ret_w = math.min(max_w, cell_w)
+  local ret_h = math.min(max_h, cell_h)
+  local view_scale = ret_w / ret_h
+  local img_scale = cell_w / cell_h
+  local fit_height = math.floor(ret_w / img_scale + 0.5)
+  local fit_width = math.floor(ret_h * img_scale + 0.5)
+  if ret_h == fit_height or ret_w == fit_width then
+    -- already fits
+  elseif img_scale > view_scale then
+    ret_h = fit_height
+  else
+    ret_w = fit_width
+  end
+  return math.max(1, math.ceil(ret_w)),
+         math.max(1, math.ceil(ret_h))
+end
+
+--- Estimate item cell height (including 2 rows for border).
+---@param thumb_w number column width in cells
+---@param cached_path? string path to cached thumbnail PNG
+local function item_height(thumb_w, cached_path)
+  local inner_w = math.max(1, thumb_w - 2)
+  if cached_path then
+    -- Use DPI-aware prediction so layout matches what snacks actually renders
+    local _, fit_h = dpi_fit(cached_path, inner_w, 999)
+    if fit_h and fit_h > 0 then
+      return math.max(1, fit_h) + 2
+    end
+  end
+  -- Fallback: assume square image
   local terminal = Snacks.image.terminal.size()
   local cell_ratio = terminal.cell_width / terminal.cell_height
-  local h = math.floor(inner_w * cell_ratio / aspect_ratio + 0.5)
-  return math.max(3, math.min(h, 30)) + 2
+  local h = math.floor(inner_w * cell_ratio + 0.5)
+  return math.max(1, h) + 2
 end
 
 ---@param g table
@@ -304,6 +351,9 @@ function M._layout(file_count, win_w, win_h, files)
   local cols = math.max(1, math.floor((win_w + pad) / (thumb_w + pad)))
   thumb_w = math.max(7, math.floor((win_w - pad * (cols - 1)) / cols))
   local win_h_cells = math.max(1, win_h)
+  -- Cap item height so a single cell never exceeds the viewport
+  -- (leaves room for the filename row + 1 row gap from parent border)
+  local max_item_h = math.max(4, win_h_cells - 2)
 
   files = files or (state and state.files) or {}
   local count = math.min(file_count or #files, #files)
@@ -320,22 +370,11 @@ function M._layout(file_count, win_w, win_h, files)
 
   for idx = 1, count do
     local file = files[idx]
-    local aspect_ratio = 1
-    local estimated = true
-    if file and file.is_dir then
-      estimated = false -- directories have fixed height, no reflow needed
-    elseif file and file.path then
+    local cached_path = nil
+    if file and not file.is_dir and file.path then
       local cached = thumb_cache_path(file.path)
       if vim.uv.fs_stat(cached) then
-        local ok, dim = pcall(Snacks.image.util.dim, cached)
-        if ok and type(dim) == "table" then
-          local w = tonumber(dim.width)
-          local h = tonumber(dim.height)
-          if w and h and w > 0 and h > 0 then
-            aspect_ratio = w / h
-            estimated = false
-          end
-        end
+        cached_path = cached
       end
     end
 
@@ -349,13 +388,12 @@ function M._layout(file_count, win_w, win_h, files)
       end
     end
 
-    local h = item_height(thumb_w, aspect_ratio)
+    local h = math.min(item_height(thumb_w, cached_path), max_item_h)
     local y = col_heights[best_col]
     items[idx] = {
       col = best_col,
       y = y,
       h = h,
-      estimated = estimated,
     }
 
     col_heights[best_col] = y + h + 1
@@ -642,15 +680,41 @@ function M._render_visible()
       local inner_h = display_h - 2 -- subtract border
       if inner_h < 1 then goto next_thumb end
 
+      -- For file thumbnails, predict DPI-adjusted rendering so the window
+      -- (border) wraps tightly around the actual image.
+      local inner_w = grid.thumb_w - 2
+      local win_inner_w = inner_w
+      local win_inner_h = inner_h
+      local win_col = item.col * cell_w
+      if not file.is_dir then
+        local cached = thumb_cache_path(file.path)
+        if vim.uv.fs_stat(cached) then
+          local fw, fh = dpi_fit(cached, inner_w, inner_h)
+          if fw and fh and fw > 0 and fh > 0 then
+            win_inner_w = math.min(fw, inner_w)
+            win_inner_h = math.min(fh, inner_h)
+            -- Center the narrower/shorter window within the column
+            if win_inner_w < inner_w then
+              local h_offset = math.floor((grid.thumb_w - (win_inner_w + 2)) / 2)
+              win_col = item.col * cell_w + h_offset
+            end
+            if win_inner_h < inner_h then
+              -- Bottom-align: push window down so border sits above filename
+              win_row = win_row + (inner_h - win_inner_h)
+            end
+          end
+        end
+      end
+
       do
         local thumb_buf = vim.api.nvim_create_buf(false, true)
         local win_opts = {
           relative = "win",
           win = s.win,
           row = win_row,
-          col = item.col * cell_w,
-          width = grid.thumb_w - 2,
-          height = inner_h,
+          col = win_col,
+          width = win_inner_w,
+          height = win_inner_h,
           style = "minimal",
           border = "rounded",
           focusable = false,
@@ -746,49 +810,35 @@ function M._render_visible()
               if state ~= s then return end
               if not vim.api.nvim_buf_is_valid(thumb_buf) then return end
               if not vim.api.nvim_win_is_valid(thumb_win) then return end
+              -- For newly generated thumbnails, resize the window to fit the
+              -- DPI-adjusted image dimensions (the window was created at full
+              -- column width since the thumbnail didn't exist at render time).
+              local cur_w = vim.api.nvim_win_get_width(thumb_win)
+              local cur_h = vim.api.nvim_win_get_height(thumb_win)
+              local fw, fh = dpi_fit(thumb_path, cur_w, cur_h)
+              if fw and fh and fw > 0 and fh > 0 then
+                local new_w = math.min(fw, cur_w)
+                local new_h = math.min(fh, cur_h)
+                if new_w ~= cur_w or new_h ~= cur_h then
+                  local current_item = s.grid and s.grid.items[idx]
+                  local col_x = current_item and (current_item.col * cell_w) or 0
+                  local cfg = { width = new_w, height = new_h }
+                  if new_w < cur_w then
+                    cfg.col = col_x + math.floor((grid.thumb_w - (new_w + 2)) / 2)
+                  end
+                  if new_h < cur_h and current_item then
+                    -- Bottom-align: push window down so border sits above filename
+                    local base_row = current_item.y - s.scroll_offset
+                    local display_h = math.min(current_item.h, grid.win_h - base_row)
+                    cfg.row = base_row + (display_h - (new_h + 2))
+                  end
+                  pcall(vim.api.nvim_win_set_config, thumb_win, cfg)
+                end
+              end
               tw.placement = Snacks.image.placement.new(thumb_buf, thumb_path, {
                 conceal = true,
                 auto_resize = true,
               })
-
-              -- Mark item for reflow if actual dimensions differ from estimate
-              local current_grid = s.grid
-              local current_item = current_grid and current_grid.items[idx]
-              if not current_item or not current_item.estimated then return end
-              local ok_dim, dim = pcall(Snacks.image.util.dim, thumb_path)
-              if not ok_dim or type(dim) ~= "table" then return end
-              local w = tonumber(dim.width)
-              local h = tonumber(dim.height)
-              if not w or not h or w <= 0 or h <= 0 then return end
-              local new_h = item_height(current_grid.thumb_w, w / h)
-              if new_h ~= current_item.h then
-                s.needs_reflow = true
-                -- Debounce: wait for more thumbnails to arrive before reflowing
-                if reflow_timer and not reflow_timer:is_closing() then
-                  reflow_timer:stop()
-                  reflow_timer:close()
-                end
-                reflow_timer = assert(vim.uv.new_timer())
-                reflow_timer:start(1000, 0, vim.schedule_wrap(function()
-                  if reflow_timer and not reflow_timer:is_closing() then
-                    reflow_timer:stop()
-                    reflow_timer:close()
-                  end
-                  reflow_timer = nil
-                  if state ~= s or not s.needs_reflow then return end
-                  if not vim.api.nvim_win_is_valid(s.win) then return end
-                  s.needs_reflow = false
-                  local win_w = vim.api.nvim_win_get_width(s.win)
-                  local win_h = vim.api.nvim_win_get_height(s.win)
-                  s.grid = M._layout(#s.files, win_w, win_h, s.files)
-                  s.scroll_offset = clamp_scroll_offset(s.grid, s.scroll_offset)
-                  ensure_item_visible(s, s.cur_idx)
-                  M._render_visible()
-                  if state == s then
-                    M._restore_cursor()
-                  end
-                end))
-              end
             end
 
             local cached = thumb_cache_path(file.path)
@@ -1323,12 +1373,6 @@ function M.close()
     rerender_timer:close()
   end
   rerender_timer = nil
-  if reflow_timer and not reflow_timer:is_closing() then
-    reflow_timer:stop()
-    reflow_timer:close()
-  end
-  reflow_timer = nil
-
   cancel_thumb_jobs(s.thumb_jobs)
   thumb_queue = {}
   pcall(vim.api.nvim_del_augroup_by_id, s.augroup)
