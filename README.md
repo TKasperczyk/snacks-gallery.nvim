@@ -70,6 +70,17 @@ require("snacks-gallery").setup({
 
 All options are optional — the defaults work out of the box.
 
+## Directory Browsing
+
+Directories appear as cells in the gallery grid alongside media files. Directory cells show thumbnail previews of the first few images inside them (once cached), or a folder icon placeholder otherwise.
+
+| Key | Action |
+|---|---|
+| `Enter` | Enter directory |
+| `-` / `Backspace` | Go to parent directory |
+
+When navigating back to a parent directory, the cursor is restored to the directory you came from.
+
 ## Keybindings
 
 Inside the gallery window:
@@ -77,9 +88,10 @@ Inside the gallery window:
 | Key | Action |
 |---|---|
 | `h` `j` `k` `l` / arrows | Navigate between thumbnails |
-| `Enter` | Open file with system viewer |
+| `Enter` | Open file with system viewer / enter directory |
 | `p` | Full-size preview in a floating window |
-| `r` | Rename file |
+| `-` / `Backspace` | Go to parent directory |
+| `r` | Rename file or directory |
 | `d` | Delete file (with confirmation) |
 | `q` / `Esc` | Close gallery |
 
@@ -97,6 +109,7 @@ All highlight groups use `default = true` so your colorscheme takes precedence:
 | `GalleryFooterKey` | `Special` | Footer keybind letters |
 | `GalleryFooterSep` | `FloatBorder` | Footer separator |
 | `GalleryFooterVal` | `Normal` | Footer values |
+| `GalleryDir` | `Directory` | Directory name label |
 
 ## License
 
