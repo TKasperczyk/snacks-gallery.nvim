@@ -272,6 +272,37 @@ local function item_height(thumb_w, cached_path)
   return math.max(1, h) + 2
 end
 
+--- Compute optimal (rows, cols) grid for n sub-previews in a w×h cell area.
+--- Targets square-ish sub-cells in pixel terms; minimum sub-cell: 3 wide × 2 tall.
+---@param n number number of previews
+---@param w number available width in cells
+---@param h number available height in cells
+---@return number rows, number cols
+local function sub_preview_grid(n, w, h)
+  if n <= 1 then
+    return 1, 1
+  end
+  local terminal = Snacks.image.terminal.size()
+  local cell_ratio = terminal.cell_width / terminal.cell_height
+  local best_rows, best_cols = 1, n
+  local best_score = math.huge
+  for cols = 1, n do
+    local rows = math.ceil(n / cols)
+    local sub_w = math.floor(w / cols)
+    local sub_h = math.floor(h / rows)
+    if sub_w >= 3 and sub_h >= 2 then
+      local pixel_aspect = (sub_w * terminal.cell_width) / (sub_h * terminal.cell_height)
+      local score = math.abs(math.log(pixel_aspect))
+      if score < best_score then
+        best_score = score
+        best_rows = rows
+        best_cols = cols
+      end
+    end
+  end
+  return best_rows, best_cols
+end
+
 ---@param g table
 ---@param offset number
 ---@return number
@@ -737,7 +768,7 @@ function M._render_visible()
             local cached_previews = {}
             local raw_previews = {}
             if file.name ~= ".." then
-              raw_previews = scan_previews(file.path, 3)
+              raw_previews = scan_previews(file.path, 6)
               for _, p in ipairs(raw_previews) do
                 if vim.uv.fs_stat(thumb_cache_path(p)) then
                   cached_previews[#cached_previews + 1] = p
@@ -745,21 +776,28 @@ function M._render_visible()
               end
             end
 
-            local n = math.min(#cached_previews, math.max(1, math.floor(cell_inner_w / 3)))
-            if #cached_previews > 0 and n > 0 then
-              -- Overlay cached preview thumbnails
-              local sub_w = math.floor(cell_inner_w / n)
+            local n = #cached_previews
+            if n > 0 then
+              -- Arrange sub-previews in a grid
+              local grid_rows, grid_cols = sub_preview_grid(n, cell_inner_w, inner_h)
+              n = math.min(n, grid_rows * grid_cols)
+              local sub_w = math.floor(cell_inner_w / grid_cols)
+              local sub_h = math.floor(inner_h / grid_rows)
               for pi = 1, n do
-                local pw = (pi == n) and (cell_inner_w - (n - 1) * sub_w) or sub_w
+                local gc = (pi - 1) % grid_cols
+                local gr = math.floor((pi - 1) / grid_cols)
+                local pw = (gc == grid_cols - 1) and (cell_inner_w - (grid_cols - 1) * sub_w) or sub_w
+                local ph = (gr == grid_rows - 1) and (inner_h - (grid_rows - 1) * sub_h) or sub_h
                 local sub_buf = vim.api.nvim_create_buf(false, true)
-                local sub_col = item.col * cell_w + 1 + (pi - 1) * sub_w
+                local sub_col = item.col * cell_w + 1 + gc * sub_w
+                local sub_row = win_row + 1 + gr * sub_h
                 local sub_ok, sub_win = pcall(vim.api.nvim_open_win, sub_buf, false, {
                   relative = "win",
                   win = s.win,
-                  row = win_row + 1,
+                  row = sub_row,
                   col = sub_col,
                   width = math.max(1, pw),
-                  height = inner_h,
+                  height = math.max(1, ph),
                   style = "minimal",
                   border = "none",
                   focusable = false,

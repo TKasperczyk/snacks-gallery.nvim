@@ -2,7 +2,7 @@
 
 Image and video gallery browser for Neovim. Uses [snacks.nvim](https://github.com/folke/snacks.nvim) for rendering thumbnails via the Kitty Graphics Protocol.
 
-<!-- TODO: screenshot -->
+![demo](demo.gif)
 
 ## Requirements
 
