@@ -609,6 +609,10 @@ function M._update_visual()
   end
   footer[#footer + 1] = { "-", "GalleryFooterKey" }
   footer[#footer + 1] = { ":Back ", "GalleryFooter" }
+  if not (file.is_dir and file.name == "..") then
+    footer[#footer + 1] = { "y", "GalleryFooterKey" }
+    footer[#footer + 1] = { ":Copy ", "GalleryFooter" }
+  end
   footer[#footer + 1] = { "r", "GalleryFooterKey" }
   footer[#footer + 1] = { ":Rename ", "GalleryFooter" }
   if not file.is_dir then
@@ -1119,6 +1123,17 @@ function M._setup_keys(buf, win, files, _grid)
   end
   vim.keymap.set("n", "-", go_parent, kopts)
   vim.keymap.set("n", "<BS>", go_parent, kopts)
+
+  vim.keymap.set("n", "y", function()
+    local s = state
+    if not s then return end
+    local idx = s.cur_idx
+    if not idx or idx > #files then return end
+    local file = files[idx]
+    if file.name == ".." then return end
+    vim.fn.setreg("+", file.path)
+    vim.notify("Copied: " .. file.path, vim.log.levels.INFO)
+  end, kopts)
 
   vim.keymap.set("n", "q", function() M.close() end, kopts)
   vim.keymap.set("n", "<Esc>", function() M.close() end, kopts)

@@ -91,6 +91,7 @@ Inside the gallery window:
 | `Enter` | Open file with system viewer / enter directory |
 | `p` | Full-size preview in a floating window |
 | `-` / `Backspace` | Go to parent directory |
+| `y` | Copy file path to clipboard |
 | `r` | Rename file or directory |
 | `d` | Delete file (with confirmation) |
 | `q` / `Esc` | Close gallery |
